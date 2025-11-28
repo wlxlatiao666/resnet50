@@ -1,0 +1,255 @@
+W1128 18:57:45.509000 39641 site-packages/torch/distributed/elastic/multiprocessing/redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+W1128 18:57:45.516000 39641 site-packages/torch/distributed/run.py:803] 
+W1128 18:57:45.516000 39641 site-packages/torch/distributed/run.py:803] *****************************************
+W1128 18:57:45.516000 39641 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1128 18:57:45.516000 39641 site-packages/torch/distributed/run.py:803] *****************************************
+=> creating model 'resnet50'
+using cpu, this will be slow
+=> Dummy data is used!
+/opt/miniconda3/lib/python3.13/site-packages/torch/utils/data/dataloader.py:692: UserWarning: 'pin_memory' argument is set as true but not supported on MPS now, device pinned memory won't be used.
+  warnings.warn(warn_msg)
+/opt/miniconda3/lib/python3.13/site-packages/torch/utils/data/dataloader.py:692: UserWarning: 'pin_memory' argument is set as true but not supported on MPS now, device pinned memory won't be used.
+  warnings.warn(warn_msg)
+/opt/miniconda3/lib/python3.13/site-packages/torch/utils/data/dataloader.py:692: UserWarning: 'pin_memory' argument is set as true but not supported on MPS now, device pinned memory won't be used.
+  warnings.warn(warn_msg)
+/opt/miniconda3/lib/python3.13/site-packages/torch/utils/data/dataloader.py:692: UserWarning: 'pin_memory' argument is set as true but not supported on MPS now, device pinned memory won't be used.
+  warnings.warn(warn_msg)
+Epoch: [0][0/5]	Time 36.589 (36.589)	Data  2.314 ( 2.314)	Loss 7.0188e+00 (7.0188e+00)	Acc@1   0.00 (  0.00)	Acc@5   0.00 (  0.00)
+W1128 18:59:01.422000 39641 site-packages/torch/distributed/elastic/agent/server/api.py:725] Received 2 death signal, shutting down workers
+W1128 18:59:01.463000 39641 site-packages/torch/distributed/elastic/multiprocessing/api.py:908] Sending process 39642 closing signal SIGINT
+W1128 18:59:01.463000 39641 site-packages/torch/distributed/elastic/multiprocessing/api.py:908] Sending process 39643 closing signal SIGINT
+W1128 18:59:01.463000 39641 site-packages/torch/distributed/elastic/multiprocessing/api.py:908] Sending process 39644 closing signal SIGINT
+W1128 18:59:01.463000 39641 site-packages/torch/distributed/elastic/multiprocessing/api.py:908] Sending process 39645 closing signal SIGINT
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 430, in <module>
+[rank1]:     main()
+[rank1]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 114, in main
+[rank1]:     main_worker(args.gpu, ngpus_per_node, args)
+[rank1]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 251, in main_worker
+[rank1]:     train(train_loader, model, criterion, optimizer, epoch, args, device)
+[rank1]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 293, in train
+[rank1]:     output = model(images)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1661, in forward
+[rank1]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1487, in _run_ddp_forward
+[rank1]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 285, in forward
+[rank1]:     return self._forward_impl(x)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 274, in _forward_impl
+[rank1]:     x = self.layer2(x)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/container.py", line 250, in forward
+[rank1]:     input = module(input)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 146, in forward
+[rank1]:     out = self.conv1(x)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 548, in forward
+[rank1]:     return self._conv_forward(input, self.weight, self.bias)
+[rank1]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 543, in _conv_forward
+[rank1]:     return F.conv2d(
+[rank1]: KeyboardInterrupt
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 430, in <module>
+[rank0]:     main()
+[rank0]:     ~~~~^^
+[rank0]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 114, in main
+[rank0]:     main_worker(args.gpu, ngpus_per_node, args)
+[rank0]:     ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 251, in main_worker
+[rank0]:     train(train_loader, model, criterion, optimizer, epoch, args, device)
+[rank0]:     ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 293, in train
+[rank0]:     output = model(images)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1661, in forward
+[rank0]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank0]:          ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1487, in _run_ddp_forward
+[rank0]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank0]:            ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 285, in forward
+[rank0]:     return self._forward_impl(x)
+[rank0]:            ~~~~~~~~~~~~~~~~~~^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 274, in _forward_impl
+[rank0]:     x = self.layer2(x)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/container.py", line 250, in forward
+[rank0]:     input = module(input)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 146, in forward
+[rank0]:     out = self.conv1(x)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 548, in forward
+[rank0]:     return self._conv_forward(input, self.weight, self.bias)
+[rank0]:            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 543, in _conv_forward
+[rank0]:     return F.conv2d(
+[rank0]:            ~~~~~~~~^
+[rank0]:         input, weight, bias, self.stride, self.padding, self.dilation, self.groups
+[rank0]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:     )
+[rank0]:     ^
+[rank0]: KeyboardInterrupt
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 430, in <module>
+[rank3]:     main()
+[rank3]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 114, in main
+[rank3]:     main_worker(args.gpu, ngpus_per_node, args)
+[rank3]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 251, in main_worker
+[rank3]:     train(train_loader, model, criterion, optimizer, epoch, args, device)
+[rank3]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 293, in train
+[rank3]:     output = model(images)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1661, in forward
+[rank3]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1487, in _run_ddp_forward
+[rank3]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 285, in forward
+[rank3]:     return self._forward_impl(x)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 274, in _forward_impl
+[rank3]:     x = self.layer2(x)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/container.py", line 250, in forward
+[rank3]:     input = module(input)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 146, in forward
+[rank3]:     out = self.conv1(x)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 548, in forward
+[rank3]:     return self._conv_forward(input, self.weight, self.bias)
+[rank3]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 543, in _conv_forward
+[rank3]:     return F.conv2d(
+[rank3]: KeyboardInterrupt
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 430, in <module>
+[rank2]:     main()
+[rank2]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 114, in main
+[rank2]:     main_worker(args.gpu, ngpus_per_node, args)
+[rank2]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 251, in main_worker
+[rank2]:     train(train_loader, model, criterion, optimizer, epoch, args, device)
+[rank2]:   File "/Users/weilongxuan/codes/resnet50/train.py", line 293, in train
+[rank2]:     output = model(images)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1661, in forward
+[rank2]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1487, in _run_ddp_forward
+[rank2]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 285, in forward
+[rank2]:     return self._forward_impl(x)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 274, in _forward_impl
+[rank2]:     x = self.layer2(x)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/container.py", line 250, in forward
+[rank2]:     input = module(input)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torchvision/models/resnet.py", line 146, in forward
+[rank2]:     out = self.conv1(x)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 548, in forward
+[rank2]:     return self._conv_forward(input, self.weight, self.bias)
+[rank2]:   File "/opt/miniconda3/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 543, in _conv_forward
+[rank2]:     return F.conv2d(
+[rank2]: KeyboardInterrupt
+Traceback (most recent call last):
+  File "/opt/miniconda3/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+    ~~~^^^^^^
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+    ~~~~~~~~~~~~~~~
+        config=config,
+        ~~~~~~~~~~~~~~
+        entrypoint=cmd,
+        ~~~~~~~~~~~~~~~
+    )(*cmd_args)
+    ~^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 284, in launch_agent
+    result = agent.run()
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/elastic/metrics/api.py", line 138, in wrapper
+    result = f(*args, **kwargs)
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/elastic/agent/server/api.py", line 717, in run
+    result = self._invoke_run(role)
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/elastic/agent/server/api.py", line 881, in _invoke_run
+    time.sleep(monitor_interval)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.13/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 85, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 39641 got signal: 2
