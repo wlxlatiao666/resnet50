@@ -36,7 +36,7 @@ def main():
                         help='path to dataset')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
-    parser.add_argument('--epochs', default=90, type=int, metavar='N',
+    parser.add_argument('--epochs', default=3, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='manual epoch number (useful on restarts)')
@@ -136,6 +136,14 @@ def main_worker(gpu, ngpus_per_node, args):
                 pass
             builtins.print = print_pass
 
+    # Determine which GPU to use
+    # When using torchrun, LOCAL_RANK is set automatically
+    if args.distributed and args.gpu is None:
+        # Get local rank from environment (set by torchrun)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        args.gpu = local_rank
+        print(f"Using GPU {args.gpu} (from LOCAL_RANK)")
+
     if args.device:
         device = torch.device(args.device)
     elif torch.cuda.is_available():
@@ -172,20 +180,15 @@ def main_worker(gpu, ngpus_per_node, args):
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
+            # This branch should not be reached now, but keep as fallback
             model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
-        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-            model.features = torch.nn.DataParallel(model.features)
-            model.cuda()
-        else:
-            model = torch.nn.DataParallel(model).cuda()
+        model = torch.nn.DataParallel(model).cuda()
 
     # Define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().to(device)
@@ -239,22 +242,50 @@ def main_worker(gpu, ngpus_per_node, args):
             args.data, args.batch_size, args.workers, args.distributed)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, args, device)
         return
+
+    # Track overall training statistics
+    training_start_time = time.time()
+    epoch_stats = []  # Store stats for each epoch
+    best_acc1 = 0
+    best_epoch = 0
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
+        epoch_start = time.time()
+        
         # Train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args, device)
+        train_stats = train(train_loader, model, criterion, optimizer, epoch, args, device)
 
         # Evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args, device)
-
-        # Remember best acc@1 and save checkpoint
-        is_best = False # Simplified for now
+        val_stats = validate(val_loader, model, criterion, args, device)
+        acc1 = val_stats['acc1']
+        
+        epoch_time = time.time() - epoch_start
+        
+        # Track best accuracy
+        is_best = acc1 > best_acc1
+        if is_best:
+            best_acc1 = acc1
+            best_epoch = epoch
+        
+        # Store epoch statistics
+        epoch_stats.append({
+            'epoch': epoch,
+            'epoch_time': epoch_time,
+            'train_loss': train_stats['loss'],
+            'train_acc1': train_stats['acc1'],
+            'train_acc5': train_stats['acc5'],
+            'train_throughput': train_stats['throughput'],
+            'val_loss': val_stats['loss'],
+            'val_acc1': val_stats['acc1'],
+            'val_acc5': val_stats['acc5'],
+            'val_throughput': val_stats['throughput'],
+        })
         
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -262,9 +293,13 @@ def main_worker(gpu, ngpus_per_node, args):
                 'epoch': epoch + 1,
                 'arch': 'resnet50',
                 'state_dict': model.state_dict(),
-                'best_acc1': acc1,
+                'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
+    
+    # Print overall training summary
+    total_training_time = time.time() - training_start_time
+    print_training_summary(epoch_stats, total_training_time, best_acc1, best_epoch, args)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args, device):
@@ -282,6 +317,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, device):
     model.train()
 
     end = time.time()
+    epoch_start = time.time()
     for i, (images, target) in enumerate(train_loader):
         # Measure data loading time
         data_time.update(time.time() - end)
@@ -295,7 +331,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, device):
 
         # Measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
+        losses.update(loss.detach().item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
@@ -309,7 +345,33 @@ def train(train_loader, model, criterion, optimizer, epoch, args, device):
         end = time.time()
 
         if i % args.print_freq == 0:
-            progress.display(i)
+            # Calculate throughput
+            throughput = images.size(0) / batch_time.val
+            avg_throughput = images.size(0) / batch_time.avg
+            progress.display(i, throughput, avg_throughput)
+    
+    # Epoch summary
+    epoch_time = time.time() - epoch_start
+    total_samples = len(train_loader.dataset)
+    avg_throughput = total_samples / epoch_time
+    print(f'\n==> Epoch {epoch} Training Summary:')
+    print(f'    Total Time: {epoch_time:.2f}s')
+    print(f'    Avg Throughput: {avg_throughput:.2f} images/sec')
+    print(f'    Avg Batch Time: {batch_time.avg:.3f}s')
+    print(f'    Avg Data Load Time: {data_time.avg:.3f}s ({100*data_time.avg/batch_time.avg:.1f}% of batch time)')
+    print(f'    Train Loss: {losses.avg:.4f}')
+    print(f'    Train Acc@1: {top1.avg:.2f}%')
+    print(f'    Train Acc@5: {top5.avg:.2f}%\n')
+    
+    # Return statistics
+    return {
+        'loss': losses.avg,
+        'acc1': top1.avg,
+        'acc5': top5.avg,
+        'throughput': avg_throughput,
+        'batch_time': batch_time.avg,
+        'data_time': data_time.avg,
+    }
 
 
 def validate(val_loader, model, criterion, args, device):
@@ -325,6 +387,7 @@ def validate(val_loader, model, criterion, args, device):
     # Switch to evaluate mode
     model.eval()
 
+    val_start = time.time()
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
@@ -337,7 +400,7 @@ def validate(val_loader, model, criterion, args, device):
 
             # Measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
+            losses.update(loss.detach().item(), images.size(0))
             top1.update(acc1[0], images.size(0))
             top5.update(acc5[0], images.size(0))
 
@@ -346,13 +409,109 @@ def validate(val_loader, model, criterion, args, device):
             end = time.time()
 
             if i % args.print_freq == 0:
-                progress.display(i)
+                throughput = images.size(0) / batch_time.val
+                avg_throughput = images.size(0) / batch_time.avg
+                progress.display(i, throughput, avg_throughput)
 
-        # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
+        val_time = time.time() - val_start
+        total_samples = len(val_loader.dataset)
+        avg_throughput = total_samples / val_time
+        
+        print(f'\n==> Validation Summary:')
+        print(f'    Total Time: {val_time:.2f}s')
+        print(f'    Avg Throughput: {avg_throughput:.2f} images/sec')
+        print(f'    Val Loss: {losses.avg:.4f}')
+        print(f'    Val Acc@1: {top1.avg:.2f}%')
+        print(f'    Val Acc@5: {top5.avg:.2f}%\n')
 
-    return top1.avg
+    # Return statistics
+    return {
+        'loss': losses.avg,
+        'acc1': top1.avg,
+        'acc5': top5.avg,
+        'throughput': avg_throughput,
+        'batch_time': batch_time.avg,
+    }
+
+
+
+def print_training_summary(epoch_stats, total_time, best_acc1, best_epoch, args):
+    """Print overall training summary after all epochs complete"""
+    if not epoch_stats:
+        return
+    
+    print('\n' + '='*100)
+    print(' '*35 + 'OVERALL TRAINING SUMMARY')
+    print('='*100)
+    
+    # Calculate overall statistics
+    num_epochs = len(epoch_stats)
+    avg_epoch_time = sum(s['epoch_time'] for s in epoch_stats) / num_epochs
+    avg_train_throughput = sum(s['train_throughput'] for s in epoch_stats) / num_epochs
+    avg_val_throughput = sum(s['val_throughput'] for s in epoch_stats) / num_epochs
+    
+    final_train_loss = epoch_stats[-1]['train_loss']
+    final_train_acc1 = epoch_stats[-1]['train_acc1']
+    final_val_loss = epoch_stats[-1]['val_loss']
+    final_val_acc1 = epoch_stats[-1]['val_acc1']
+    
+    # Print overall statistics
+    print(f'\nTraining Configuration:')
+    print(f'  Total Epochs: {num_epochs}')
+    print(f'  Batch Size: {args.batch_size}')
+    print(f'  Workers: {args.workers}')
+    print(f'  Initial LR: {args.lr}')
+    
+    print(f'\nTime Statistics:')
+    print(f'  Total Training Time: {total_time:.2f}s ({total_time/3600:.2f} hours)')
+    print(f'  Avg Time per Epoch: {avg_epoch_time:.2f}s ({avg_epoch_time/60:.2f} minutes)')
+    print(f'  Fastest Epoch: {min(s["epoch_time"] for s in epoch_stats):.2f}s (Epoch {min(range(len(epoch_stats)), key=lambda i: epoch_stats[i]["epoch_time"])})')
+    print(f'  Slowest Epoch: {max(s["epoch_time"] for s in epoch_stats):.2f}s (Epoch {max(range(len(epoch_stats)), key=lambda i: epoch_stats[i]["epoch_time"])})')
+    
+    print(f'\nThroughput Statistics:')
+    print(f'  Avg Training Throughput: {avg_train_throughput:.2f} images/sec')
+    print(f'  Avg Validation Throughput: {avg_val_throughput:.2f} images/sec')
+    
+    print(f'\nAccuracy Statistics:')
+    print(f'  Best Val Acc@1: {best_acc1:.2f}% (Epoch {best_epoch})')
+    print(f'  Final Train Acc@1: {final_train_acc1:.2f}%')
+    print(f'  Final Val Acc@1: {final_val_acc1:.2f}%')
+    print(f'  Train/Val Gap: {abs(final_train_acc1 - final_val_acc1):.2f}%')
+    
+    print(f'\nLoss Statistics:')
+    print(f'  Final Train Loss: {final_train_loss:.4f}')
+    print(f'  Final Val Loss: {final_val_loss:.4f}')
+    print(f'  Best Train Loss: {min(s["train_loss"] for s in epoch_stats):.4f} (Epoch {min(range(len(epoch_stats)), key=lambda i: epoch_stats[i]["train_loss"])})')
+    print(f'  Best Val Loss: {min(s["val_loss"] for s in epoch_stats):.4f} (Epoch {min(range(len(epoch_stats)), key=lambda i: epoch_stats[i]["val_loss"])})')
+    
+    # Print epoch-by-epoch table (show first 5, last 5, and best epoch if not in those ranges)
+    print(f'\nEpoch-by-Epoch Progress:')
+    print(f'{"Epoch":<8} {"Time(s)":<10} {"Train Loss":<12} {"Train Acc@1":<12} {"Val Loss":<12} {"Val Acc@1":<12} {"Throughput":<15}')
+    print('-'*100)
+    
+    epochs_to_show = set()
+    # First 5 epochs
+    epochs_to_show.update(range(min(5, num_epochs)))
+    # Last 5 epochs
+    epochs_to_show.update(range(max(0, num_epochs - 5), num_epochs))
+    # Best epoch
+    epochs_to_show.add(best_epoch)
+    
+    last_shown = -1
+    for i in sorted(epochs_to_show):
+        if i - last_shown > 1:
+            print('  ...')
+        s = epoch_stats[i]
+        marker = ' *' if i == best_epoch else ''
+        print(f'{s["epoch"]:<8} {s["epoch_time"]:<10.2f} {s["train_loss"]:<12.4f} '
+              f'{s["train_acc1"]:<12.2f} {s["val_loss"]:<12.4f} {s["val_acc1"]:<12.2f} '
+              f'{s["train_throughput"]:<15.1f}{marker}')
+        last_shown = i
+    
+    print('\n* = Best validation accuracy')
+    print('='*100)
+    print(f'Training completed! Best model saved with Val Acc@1: {best_acc1:.2f}% at Epoch {best_epoch}')
+    print('='*100 + '\n')
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -391,9 +550,11 @@ class ProgressMeter(object):
         self.meters = meters
         self.prefix = prefix
 
-    def display(self, batch):
+    def display(self, batch, throughput=None, avg_throughput=None):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
+        if throughput is not None and avg_throughput is not None:
+            entries.append(f'Throughput {throughput:.1f} ({avg_throughput:.1f}) img/s')
         print('\t'.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
