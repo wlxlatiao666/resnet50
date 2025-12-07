@@ -10,13 +10,20 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms, datasets, models
 from torch.utils.tensorboard import SummaryWriter
+import socket
+import threading
+
+# 定义参数服务器角色
+PS_RANK = 0  # 第0个进程作为参数服务器
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     
-    # 初始化进程组
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    # 初始化进程组，使用gloo后端以便CPU也能工作
+    # (PS架构通常用在CPU集群上，但这里我们同时支持CPU和GPU)
+    backend = "gloo" if not torch.cuda.is_available() else "nccl"
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
 
 def cleanup():
     dist.destroy_process_group()
@@ -24,269 +31,142 @@ def cleanup():
 class ParameterServer:
     def __init__(self, model):
         self.model = model
-        self.params = [p.data for p in model.parameters()]
-        self.grads = [torch.zeros_like(p.data) for p in model.parameters()]
-        self.worker_count = 0
-
-    def push_parameters(self):
-        # 将参数广播到所有工作节点
-        for idx, param in enumerate(self.params):
-            dist.broadcast(param, src=0)
-    
-    def pull_gradients(self, worker_rank):
-        # 接收工作节点的梯度
-        for idx, grad in enumerate(self.grads):
-            dist.recv(grad, src=worker_rank)
-            
-        self.worker_count += 1
-    
-    def update(self, optimizer):
-        # 将收集到的梯度应用到模型中
-        for param, grad in zip(self.model.parameters(), self.grads):
-            param.grad = grad.clone() / self.worker_count
+        self.lock = threading.Lock()
         
-        # 执行优化步骤
-        optimizer.step()
-        optimizer.zero_grad()
-        
-        # 重置梯度和计数器
-        for grad in self.grads:
-            grad.zero_()
-        self.worker_count = 0
-
-class ParameterClient:
-    def __init__(self, model, rank):
-        self.model = model
-        self.rank = rank
-    
-    def pull_parameters(self):
-        # 从参数服务器获取参数
-        for param in self.model.parameters():
-            dist.broadcast(param.data, src=0)
-    
-    def push_gradients(self):
-        # 发送梯度到参数服务器
-        for param in self.model.parameters():
-            if param.grad is not None:
-                dist.send(param.grad.data, dst=0)
-
-def train_ps(rank, world_size, args):
-    setup(rank, world_size)
-    
-    if rank == 0:
-        print(f"使用Parameter-Server架构, {world_size-1} 个工作节点")
-        
-    # 固定随机种子以便结果可复现
-    torch.manual_seed(42 + rank)
-    
-    # 数据预处理
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    val_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    # 加载数据集
-    train_dataset = datasets.ImageFolder(
-        os.path.join(args.data_path, 'train'),
-        transform=train_transform
-    )
-
-    val_dataset = datasets.ImageFolder(
-        os.path.join(args.data_path, 'val'),
-        transform=val_transform
-    )
-
-    # 创建分布式采样器 - 只用于工作节点
-    if rank > 0:  # 工作节点
-        train_sampler = DistributedSampler(
-            train_dataset, num_replicas=world_size-1, rank=rank-1, shuffle=True
-        )
-        
-        val_sampler = DistributedSampler(
-            val_dataset, num_replicas=world_size-1, rank=rank-1, shuffle=False
-        )
-
-        # 创建数据加载器
-        train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, sampler=train_sampler,
-            num_workers=4, pin_memory=True
-        )
-
-        val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, sampler=val_sampler,
-            num_workers=4, pin_memory=True
-        )
-    else:  # 参数服务器
-        # 参数服务器不需要数据加载器，但为了验证需要一个
-        val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=4, pin_memory=True
-        )
-
-    # 定义模型
-    model = models.resnet50(weights=None)
-    if torch.cuda.is_available() and rank > 0:  # 工作节点使用GPU
-        device = torch.device(f'cuda:{rank-1}')
-        model = model.to(device)
-    else:  # 参数服务器使用CPU
-        device = torch.device('cpu')
-        model = model.to(device)
-    
-    # 定义损失函数
-    criterion = nn.CrossEntropyLoss()
-    
-    # 创建Parameter Server或Client
-    if rank == 0:  # 参数服务器
-        server = ParameterServer(model)
-        optimizer = optim.SGD(model.parameters(), lr=args.lr,
-                             momentum=args.momentum, weight_decay=args.weight_decay)
-        lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 80], gamma=0.1)
-        writer = SummaryWriter(log_dir='./logs/parameter_server')
-    else:  # 工作节点
-        client = ParameterClient(model, rank)
-        
-    # 同步障碍
-    dist.barrier()
-    
-    def train_worker(epoch):
-        model.train()
-        train_sampler.set_epoch(epoch)
-        running_loss = 0.0
-        running_correct = 0
-        total_samples = 0
-        
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            
-            # 从参数服务器获取最新参数
-            client.pull_parameters()
-            
-            # 前向传播
-            output = model(data)
-            loss = criterion(output, target)
-            
-            # 反向传播
-            loss.backward()
-            
-            # 将梯度发送到参数服务器
-            client.push_gradients()
-            
-            # 统计
-            _, predicted = output.max(1)
-            total_samples += target.size(0)
-            running_correct += predicted.eq(target).sum().item()
-            running_loss += loss.detach().item() * target.size(0)
-            
-            # 打印信息
-            if batch_idx % args.log_interval == 0:
-                print(f'Worker {rank}, Epoch: {epoch}, Batch: {batch_idx}/{len(train_loader)}, '
-                      f'Loss: {loss.detach().item():.4f}')
-        
-        # 计算平均损失和准确率
-        avg_loss = running_loss / total_samples
-        accuracy = 100. * running_correct / total_samples
-        
-        return avg_loss, accuracy
-    
-    def train_server(epoch):
-        total_workers = world_size - 1
-        
-        # 将参数广播到所有工作节点
-        server.push_parameters()
-        
-        # 等待所有工作节点的梯度
-        for worker_rank in range(1, world_size):
-            server.pull_gradients(worker_rank)
-        
-        # 更新模型参数
-        server.update(optimizer)
-        
-        return model
-    
-    def validate(epoch):
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for data, target in val_loader:
-                data, target = data.to(device), target.to(device)
-                output = model(data)
-                val_loss += criterion(output, target).item() * target.size(0)
+    def average_gradients(self, worker_count):
+        """接收所有worker的梯度，平均后更新模型参数"""
+        with self.lock:
+            for param in self.model.parameters():
+                # 将梯度初始化为0
+                param.grad = torch.zeros_like(param.data)
                 
-                _, predicted = output.max(1)
-                total += target.size(0)
-                correct += predicted.eq(target).sum().item()
-        
-        val_loss /= total
-        accuracy = 100. * correct / total
-        
-        if rank == 0:  # 参数服务器记录日志
-            print(f'Validation Epoch: {epoch}, Loss: {val_loss:.4f}, Accuracy: {accuracy:.2f}%')
-            writer.add_scalar('Loss/val', val_loss, epoch)
-            writer.add_scalar('Accuracy/val', accuracy, epoch)
-        
-        return val_loss, accuracy
-    
-    # 打印模型信息
-    if rank == 0:
-        os.makedirs(args.save_path, exist_ok=True)
-        print(f"批次大小: {args.batch_size} (每个工作节点), 全局批次大小: {args.batch_size * (world_size-1)}")
-        print(f"数据集大小: {len(train_dataset)} 训练样本, {len(val_dataset)} 验证样本")
-        
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"模型参数量: {total_params/1e6:.2f}M")
+                # 从每个worker接收梯度并累加
+                for worker_rank in range(1, worker_count + 1):
+                    grad_tensor = torch.zeros_like(param.data)
+                    dist.recv(grad_tensor, src=worker_rank)
+                    param.grad.add_(grad_tensor)
+                
+                # 计算梯度平均值
+                param.grad.div_(worker_count)
+            
+            # 更新模型参数
+            return True
 
-    best_acc = 0
+def ps_worker(rank, world_size, args):
+    setup(rank, world_size)
+    worker_count = world_size - 1  # 减去参数服务器
     
-    # 训练循环
-    for epoch in range(1, args.epochs + 1):
-        start_time = time.time()
+    if rank == PS_RANK:
+        # 参数服务器进程逻辑
+        print(f"参数服务器启动在rank={rank}")
         
-        if rank == 0:
+        # 初始化模型
+        model = models.resnet50(weights=None)
+        if torch.cuda.is_available():
+            model = model.cuda()
+        
+        # 初始化参数服务器
+        param_server = ParameterServer(model)
+        
+        # 定义优化器
+        optimizer = optim.SGD(model.parameters(), lr=args.lr,
+                              momentum=args.momentum, weight_decay=args.weight_decay)
+        
+        # 学习率调度器
+        lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 80], gamma=0.1)
+
+        # TensorBoard日志
+        writer = SummaryWriter(log_dir='./logs/parameter_server')
+
+        best_acc = 0
+        results = {
+            'train_time': [],
+            'train_loss': [],
+            'train_acc': [],
+            'val_time': [],
+            'val_loss': [],
+            'val_acc': []
+        }
+        
+        # 训练循环
+        for epoch in range(1, args.epochs + 1):
             print(f"\n--- Epoch {epoch}/{args.epochs} ---")
-        
-        # 同步所有进程开始训练
-        dist.barrier()
-        
-        # 训练
-        train_start = time.time()
-        
-        if rank == 0:  # 参数服务器
-            model = train_server(epoch)
+            start_time = time.time()
+            epoch_loss = 0
+            
+            # 广播当前模型参数给所有worker
+            for param in model.parameters():
+                for worker_rank in range(1, world_size):
+                    dist.send(param.data, dst=worker_rank)
+            
+            # 等待所有worker完成训练并发送梯度
+            steps = 0
+            running_loss = 0
+            while steps < len(train_dataset) // (args.batch_size * worker_count):
+                # 接收并平均梯度
+                if param_server.average_gradients(worker_count):
+                    # 执行优化器步骤
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    steps += 1
+                
+                # 接收训练损失
+                loss_tensor = torch.zeros(1)
+                for worker_rank in range(1, world_size):
+                    dist.recv(loss_tensor, src=worker_rank)
+                    running_loss += loss_tensor.item() / worker_count
+                
+                if steps % args.log_interval == 0:
+                    print(f'Train Epoch: {epoch} [{steps * args.batch_size * worker_count}/{len(train_dataset)} '
+                          f'({100. * steps / (len(train_dataset) // (args.batch_size * worker_count)):.0f}%)]\t'
+                          f'Loss: {running_loss / args.log_interval:.4f}')
+                    writer.add_scalar('Loss/train_step', running_loss / args.log_interval, 
+                                     epoch * (len(train_dataset) // (args.batch_size * worker_count)) + steps)
+                    running_loss = 0
+            
+            train_time = time.time() - start_time
+            results['train_time'].append(train_time)
+            
+            # 执行验证
+            model.eval()
+            val_loss = 0
+            correct = 0
+            val_start_time = time.time()
+            
+            # 广播开始验证信号
+            signal = torch.tensor([1])
+            for worker_rank in range(1, world_size):
+                dist.send(signal, dst=worker_rank)
+            
+            # 接收验证结果
+            val_loss_tensor = torch.zeros(1)
+            val_correct_tensor = torch.zeros(1, dtype=torch.long)
+            val_total_tensor = torch.zeros(1, dtype=torch.long)
+            
+            for worker_rank in range(1, world_count):
+                dist.recv(val_loss_tensor, src=worker_rank)
+                val_loss += val_loss_tensor.item()
+                
+                dist.recv(val_correct_tensor, src=worker_rank)
+                correct += val_correct_tensor.item()
+                
+                dist.recv(val_total_tensor, src=worker_rank)
+                total = val_total_tensor.item()
+            
+            val_loss /= worker_count
+            val_acc = 100. * correct / total
+            val_time = time.time() - val_start_time
+            
+            results['val_time'].append(val_time)
+            results['val_loss'].append(val_loss)
+            results['val_acc'].append(val_acc)
+            
+            print(f"验证集 - 平均损失: {val_loss:.4f}, 准确率: {val_acc:.2f}%")
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('Accuracy/val', val_acc, epoch)
+            
+            # 更新学习率
             lr_scheduler.step()
-        else:  # 工作节点
-            train_loss, train_acc = train_worker(epoch)
-        
-        train_time = time.time() - train_start
-        
-        # 确保所有节点完成训练后再进行验证
-        dist.barrier()
-        
-        # 验证 - 只在参数服务器执行
-        if rank == 0:
-            val_start = time.time()
-            val_loss, val_acc = validate(epoch)
-            val_time = time.time() - val_start
-            
-            epoch_time = time.time() - start_time
-            print(f"Epoch {epoch} 完成, 总用时: {epoch_time:.2f}s, "
-                  f"训练: {train_time:.2f}s, 验证: {val_time:.2f}s")
-            
-            # 记录到TensorBoard
-            writer.add_scalar('Time/epoch', epoch_time, epoch)
-            writer.add_scalar('Time/train', train_time, epoch)
-            writer.add_scalar('Time/val', val_time, epoch)
             
             # 保存模型
             if val_acc > best_acc:
@@ -302,21 +182,151 @@ def train_ps(rank, world_size, args):
                 'scheduler_state_dict': lr_scheduler.state_dict(),
                 'best_acc': best_acc,
             }, f"{args.save_path}/resnet50_ps_epoch{epoch}.pth")
-    
-    if rank == 0:
+        
         # 保存最终模型
         torch.save(model.state_dict(), f"{args.save_path}/resnet50_ps_final.pth")
         
         # 打印最终结果
         print(f"\n训练完成!")
         print(f"最佳验证准确率: {best_acc:.2f}%")
+        print(f"平均每个epoch训练时间: {sum(results['train_time'])/args.epochs:.2f}秒")
+        print(f"平均每个epoch验证时间: {sum(results['val_time'])/args.epochs:.2f}秒")
+    
+    else:
+        # Worker进程逻辑
+        worker_id = rank - 1  # 从0开始的worker ID
+        print(f"Worker {worker_id} 启动在rank={rank}")
+        
+        # 固定随机种子以便结果可复现
+        torch.manual_seed(42 + worker_id)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(worker_id % torch.cuda.device_count())
+            torch.cuda.manual_seed(42 + worker_id)
+        
+        # 数据预处理
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        val_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        # 加载数据集
+        train_dataset = datasets.ImageFolder(
+            os.path.join(args.data_path, 'train'),
+            transform=train_transform
+        )
+
+        val_dataset = datasets.ImageFolder(
+            os.path.join(args.data_path, 'val'),
+            transform=val_transform
+        )
+
+        # 创建分布式采样器 (仅worker之间分配数据)
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=worker_count, rank=worker_id, shuffle=True
+        )
+        
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=worker_count, rank=worker_id, shuffle=False
+        )
+
+        # 创建数据加载器
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, sampler=train_sampler,
+            num_workers=4, pin_memory=True
+        )
+
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, sampler=val_sampler,
+            num_workers=4, pin_memory=True
+        )
+
+        # 定义模型
+        model = models.resnet50(weights=None)
+        device = torch.device(f"cuda:{worker_id % torch.cuda.device_count()}" 
+                              if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        
+        # 定义损失函数
+        criterion = nn.CrossEntropyLoss()
+
+        # 训练循环
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            train_sampler.set_epoch(epoch)  # 确保在每个epoch中数据被打乱
+            
+            # 从参数服务器接收最新模型参数
+            for param in model.parameters():
+                recv_param = torch.zeros_like(param.data)
+                dist.recv(recv_param, src=PS_RANK)
+                param.data.copy_(recv_param)
+            
+            # 训练步骤
+            for batch_idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(device), target.to(device)
+                
+                # 前向传播
+                output = model(data)
+                loss = criterion(output, target)
+                
+                # 反向传播计算梯度
+                loss.backward()
+                
+                # 发送梯度到参数服务器
+                for param in model.parameters():
+                    if param.grad is not None:
+                        dist.send(param.grad, dst=PS_RANK)
+                
+                # 发送损失到参数服务器
+                loss_tensor = torch.tensor([loss.item()])
+                dist.send(loss_tensor, dst=PS_RANK)
+                
+                # 清零梯度
+                model.zero_grad()
+            
+            # 等待参数服务器的验证信号
+            signal = torch.zeros(1)
+            dist.recv(signal, src=PS_RANK)
+            
+            # 执行验证
+            model.eval()
+            val_loss = 0
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for data, target in val_loader:
+                    data, target = data.to(device), target.to(device)
+                    output = model(data)
+                    val_loss += criterion(output, target).item() * target.size(0)
+                    _, predicted = output.max(1)
+                    total += target.size(0)
+                    correct += predicted.eq(target).sum().item()
+            
+            # 发送验证结果到参数服务器
+            val_loss_tensor = torch.tensor([val_loss])
+            dist.send(val_loss_tensor, dst=PS_RANK)
+            
+            val_correct_tensor = torch.tensor([correct], dtype=torch.long)
+            dist.send(val_correct_tensor, dst=PS_RANK)
+            
+            val_total_tensor = torch.tensor([total], dtype=torch.long)
+            dist.send(val_total_tensor, dst=PS_RANK)
     
     cleanup()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-path', default='/path/to/imagenet', help='ImageNet数据集路径')
-    parser.add_argument('--batch-size', type=int, default=128, help='每个工作节点的批次大小')
+    parser.add_argument('--batch-size', type=int, default=128, help='每个worker的批次大小')
     parser.add_argument('--epochs', type=int, default=90, help='训练轮数')
     parser.add_argument('--lr', type=float, default=0.1, help='初始学习率')
     parser.add_argument('--momentum', type=float, default=0.9, help='SGD动量')
@@ -325,6 +335,9 @@ if __name__ == '__main__':
     parser.add_argument('--save-path', default='./checkpoints', help='模型保存路径')
     args = parser.parse_args()
     
-    # 使用多进程启动训练，+1是为了参数服务器
-    world_size = torch.cuda.device_count() + 1
-    mp.spawn(train_ps, args=(world_size, args), nprocs=world_size, join=True)
+    # 创建保存路径
+    os.makedirs(args.save_path, exist_ok=True)
+    
+    # 使用torch.multiprocessing启动多个进程
+    world_size = torch.cuda.device_count() + 1  # +1是因为有一个参数服务器
+    mp.spawn(ps_worker, args=(world_size, args), nprocs=world_size, join=True)
