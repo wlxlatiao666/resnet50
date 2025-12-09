@@ -11,190 +11,241 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms, datasets, models
 from torch.utils.tensorboard import SummaryWriter
 import collections
-from contextlib import contextmanager
+import threading
 
 class CustomDistributedDataParallel(nn.Module):
-    def __init__(self, module, device_ids, output_device=None, broadcast_buffers=True, 
-                 bucket_cap_mb=25, find_unused_parameters=False, gradient_as_bucket_view=False,
+    def __init__(self, module, device_ids=None, output_device=None, 
+                 broadcast_buffers=True, bucket_cap_mb=25, 
+                 find_unused_parameters=False, gradient_as_bucket_view=False,
                  num_process_groups=1):
-        super(CustomDistributedDataParallel, self).__init__()
+        super().__init__()
         self.module = module
-        self.device_ids = device_ids if device_ids else list(range(torch.cuda.device_count()))
-        self.output_device = output_device if output_device is not None else self.device_ids[0]
+        self.device_ids = device_ids
+        self.output_device = output_device if output_device is not None else device_ids[0]
         self.broadcast_buffers = broadcast_buffers
         self.bucket_cap_mb = bucket_cap_mb
         self.find_unused_parameters = find_unused_parameters
         self.gradient_as_bucket_view = gradient_as_bucket_view
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+        self.num_process_groups = num_process_groups
         
-        # Creating round-robin process groups
+        # 创建多个进程组用于Round-Robin调度
         self.process_groups = []
-        if num_process_groups > 1:
-            for i in range(num_process_groups):
-                pg = dist.new_group(ranks=list(range(self.world_size)))
+        if self.num_process_groups > 1:
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            for i in range(self.num_process_groups):
+                pg = dist.new_group(list(range(world_size)))
                 self.process_groups.append(pg)
         else:
-            self.process_groups.append(dist.group.WORLD)
-        self.pg_count = len(self.process_groups)
-        self.pg_idx = 0
+            self.process_groups = [dist.group.WORLD]
         
-        # Parameters that require gradients
-        self.params = [p for p in self.module.parameters() if p.requires_grad]
+        # 注册参数
+        self._register_parameters()
         
-        # Create buckets for parameters
-        self._create_parameter_buckets()
+        # 创建参数到bucket的映射
+        self._create_buckets()
         
-        # Register hooks
-        self._register_hooks()
+        # 创建通信锁，用于同步参数广播
+        self.comm_lock = threading.Lock()
         
-        # Sync buffers initially
-        self._sync_buffers()
-        
-        # For skipping gradient synchronization
-        self.require_backward_grad_sync = True
-        
-        # For tracking unused parameters
+        # 用于跟踪未使用参数的位图
+        self.unused_parameter_bitmap = None
         if self.find_unused_parameters:
-            self.unused_parameters = torch.zeros(len(self.params), dtype=torch.bool, device=self.output_device)
-            self.has_used_params = False
+            self.unused_parameter_bitmap = torch.zeros(
+                len(list(self.module.parameters())), dtype=torch.bool, 
+                device=f'cuda:{self.device_ids[0]}'
+            )
+        
+        # 用于no_sync上下文管理器
+        self.require_backward_grad_sync = True
+        self.require_forward_param_sync = True
     
-    def _create_parameter_buckets(self):
-        # Create buckets in reverse order to better match backward pass execution
-        self.buckets = []
-        bucket_size_limit = self.bucket_cap_mb * 1024 * 1024  # Convert MB to bytes
-        current_bucket = []
-        current_bucket_size = 0
+    def _register_parameters(self):
+        """
+        注册模型的所有参数并为其准备梯度同步所需的钩子
+        """
+        self.parameter_list = list(self.module.parameters())
+        # map parameter id -> index to avoid tensor equality/hash issues
+        self.parameter_list_indices = {id(p): i for i, p in enumerate(self.parameter_list)}
+        self.all_parameters_set = set(self.parameter_list)
         
-        # Sort params by size to optimize bucket creation
-        params_with_index = [(i, p) for i, p in enumerate(self.params)]
-        params_with_index.sort(key=lambda x: x[1].numel(), reverse=True)
-        
-        # Assign params to buckets
-        for idx, param in params_with_index:
-            param_size = param.numel() * param.element_size()
-            if current_bucket_size + param_size > bucket_size_limit and current_bucket:
-                self.buckets.append(current_bucket)
-                current_bucket = []
-                current_bucket_size = 0
-            
-            current_bucket.append((idx, param))
-            current_bucket_size += param_size
-        
-        # Add the last bucket if not empty
-        if current_bucket:
-            self.buckets.append(current_bucket)
-        
-        # Reverse the buckets to align with backward pass order
-        self.buckets.reverse()
-    
-    def _register_hooks(self):
-        # Per-parameter hooks
+        # 为每个参数注册钩子函数，在反向传播时收集梯度
         self.grad_accs = []
-        
-        # Register backward hooks for overlapping computation and communication
-        for bucket_idx, bucket in enumerate(self.buckets):
-            for param_idx, param in bucket:
-                def grad_hook(param, bucket_idx=bucket_idx):
-                    return self._grad_hook(param, bucket_idx)
-                
-                acc = param.register_hook(grad_hook)
+        for param in self.parameter_list:
+            if param.requires_grad:
+                def grad_hook(param):
+                    def hook(*_):
+                        self._grad_ready_for_sync(param)
+                    return hook
+                acc = param.register_hook(grad_hook(param))
                 self.grad_accs.append(acc)
     
-    def _grad_hook(self, grad, bucket_idx):
-        # Skip if we're not syncing gradients in this iteration
+    def _create_buckets(self):
+        """
+        根据bucket_cap_mb创建梯度bucket，以便批量进行梯度聚合
+        """
+        self.buckets = {}
+        self.bucket_parameters = collections.defaultdict(list)
+        # reverse mapping: parameter id -> bucket id (avoid tensor comparisons)
+        self.param_to_bucket = {}
+        
+        # 以MB为单位的bucket容量
+        bucket_cap_bytes = int(self.bucket_cap_mb * 1024 * 1024)
+        bucket_id = 0
+        current_bucket_bytes = 0
+        
+        # 以逆序遍历参数列表，因为反向传播时参数梯度的计算顺序与前向传播相反
+        for param in reversed(self.parameter_list):
+            if not param.requires_grad:
+                continue
+                
+            param_bytes = param.numel() * param.element_size()
+            
+            # 如果当前bucket已满，创建新的bucket
+            if current_bucket_bytes + param_bytes > bucket_cap_bytes and current_bucket_bytes > 0:
+                bucket_id += 1
+                current_bucket_bytes = 0
+                
+            # 将参数添加到当前bucket
+            self.bucket_parameters[bucket_id].append(param)
+            # record reverse mapping by id to avoid tensor equality
+            self.param_to_bucket[id(param)] = bucket_id
+            current_bucket_bytes += param_bytes
+        
+        # 为每个bucket创建一个事件，用于同步
+        self.bucket_events = {
+            bucket_id: torch.cuda.Event(enable_timing=False, blocking=False)
+            for bucket_id in self.bucket_parameters.keys()
+        }
+        
+        # 跟踪每个bucket中已准备好的梯度数量
+        self.bucket_ready_parameters = {
+            bucket_id: 0 for bucket_id in self.bucket_parameters.keys()
+        }
+        
+        # 分配进程组给每个bucket(Round-Robin方式)
+        self.bucket_process_groups = {}
+        for i, bucket_id in enumerate(self.bucket_parameters.keys()):
+            pg_idx = i % len(self.process_groups)
+            self.bucket_process_groups[bucket_id] = self.process_groups[pg_idx]
+    
+    def _get_param_bucket(self, param):
+        """获取参数所属的bucket ID"""
+        return self.param_to_bucket.get(id(param), None)
+    
+    def _grad_ready_for_sync(self, param):
+        """当参数的梯度计算完成时调用此函数"""
         if not self.require_backward_grad_sync:
-            return grad
-            
-        # Mark parameter as used for unused parameter detection
-        if self.find_unused_parameters and grad is not None:
-            param_index = next((i for i, (idx, p) in enumerate(self.buckets[bucket_idx]) 
-                               if p.grad is grad), None)
-            if param_index is not None:
-                self.unused_parameters[param_index] = False
-                self.has_used_params = True
+            return
         
-        # Check if all grads in the bucket are ready
-        bucket = self.buckets[bucket_idx]
-        ready = all(p.grad is not None for _, p in bucket)
-        
-        if ready:
-            # Get the process group in round-robin fashion
-            process_group = self.process_groups[self.pg_idx]
-            self.pg_idx = (self.pg_idx + 1) % self.pg_count
-            
-            # Perform AllReduce
-            grads = [p.grad for _, p in bucket]
-            flat_grads = _flatten_dense_tensors(grads)
-            
-            # Actual communication - AllReduce
-            dist.all_reduce(flat_grads, group=process_group)
-            flat_grads.div_(self.world_size)
-            
-            # Copy the reduced gradients back to their original variables
-            _unflatten_dense_tensors(flat_grads, grads)
-            
-        return grad
-    
-    def _sync_buffers(self):
-        # Synchronize buffers across processes
-        if self.broadcast_buffers and len(list(self.module.buffers())) > 0:
-            for buf in self.module.buffers():
-                # Broadcast from rank 0 to all others
-                dist.broadcast(buf, 0)
-    
-    @contextmanager
-    def no_sync(self):
-        """
-        Context manager to disable gradient synchronization
-        """
-        old_require_backward_grad_sync = self.require_backward_grad_sync
-        self.require_backward_grad_sync = False
-        try:
-            yield
-        finally:
-            self.require_backward_grad_sync = old_require_backward_grad_sync
-
-    def forward(self, *inputs, **kwargs):
-        # Sync buffers before forward pass
-        if self.broadcast_buffers:
-            self._sync_buffers()
-        
-        # If we're tracking unused parameters, reset the tracking tensor
+        # 如果启用了未使用参数检测，更新位图
         if self.find_unused_parameters:
-            self.unused_parameters.fill_(True)
-            self.has_used_params = False
+            param_idx = self.parameter_list_indices[param]
+            self.unused_parameter_bitmap[param_idx] = True
         
-        # Perform forward pass
-        output = self.module(*inputs, **kwargs)
+        # 找到参数所属的bucket
+        bucket_id = self._get_param_bucket(param)
+        if bucket_id is None:
+            return
+            
+        # 增加已准备好参数的计数
+        self.bucket_ready_parameters[bucket_id] += 1
         
-        # After forward pass, handle unused parameters
-        if self.find_unused_parameters and self.has_used_params:
-            # We need to sync unused parameters info across processes
-            # In a real implementation, you'd use AllReduce to do a logical AND operation
-            dist.all_reduce(self.unused_parameters.int(), op=dist.ReduceOp.BAND)
-        
-        return output
-
-def _flatten_dense_tensors(tensors):
-    """Flatten dense tensors into a contiguous 1D buffer"""
-    if len(tensors) == 1:
-        return tensors[0].view(-1).clone()
-    flat = torch.cat([t.view(-1) for t in tensors], dim=0)
-    return flat
-
-def _unflatten_dense_tensors(flat, tensors):
-    """View a flat buffer using the sizes of tensors"""
-    outputs = []
-    offset = 0
-    for tensor in tensors:
-        numel = tensor.numel()
-        outputs.append(flat.narrow(0, offset, numel).view_as(tensor))
-        offset += numel
+        # 检查是否所有参数都准备好了
+        if self.bucket_ready_parameters[bucket_id] == len(self.bucket_parameters[bucket_id]):
+            self._launch_bucket_allreduce(bucket_id)
     
-    # Copy into original tensors
-    for i, tensor in enumerate(tensors):
-        tensor.copy_(outputs[i])
+    def _launch_bucket_allreduce(self, bucket_id):
+        """为指定bucket启动异步AllReduce操作"""
+        # 获取bucket中所有参数的梯度
+        bucket_params = self.bucket_parameters[bucket_id]
+        
+        # 创建bucket张量列表
+        bucket_tensors = []
+        for param in bucket_params:
+            if param.grad is not None:
+                bucket_tensors.append(param.grad)
+            else:
+                # 如果梯度为None，创建一个全零梯度
+                param.grad = torch.zeros_like(param.data)
+                bucket_tensors.append(param.grad)
+        
+        # 使用异步AllReduce
+        with self.comm_lock:
+            process_group = self.bucket_process_groups[bucket_id]
+            
+            # 启动异步AllReduce
+            handles = []
+            for tensor in bucket_tensors:
+                handle = dist.all_reduce(tensor, group=process_group, async_op=True)
+                handles.append(handle)
+            
+            # 等待所有通信操作完成
+            for handle in handles:
+                handle.wait()
+            
+            # 关键修复：除以world_size进行平均
+            world_size = dist.get_world_size()
+            for tensor in bucket_tensors:
+                tensor.div_(world_size)
+            
+            # 标记bucket已完成
+            self.bucket_events[bucket_id].record()
+        
+        # 重置bucket的ready参数计数
+        self.bucket_ready_parameters[bucket_id] = 0
+
+    def _sync_unused_parameters(self):
+        """同步未使用参数的信息"""
+        if not self.find_unused_parameters:
+            return
+            
+        # 使用AllReduce操作收集所有进程中未使用参数的信息
+        dist.all_reduce(self.unused_parameter_bitmap, op=dist.ReduceOp.MAX)
+        
+        # 对于全局未使用的参数，我们需要将其梯度设置为零
+        for i, used in enumerate(self.unused_parameter_bitmap):
+            if not used:
+                param = self.parameter_list[i]
+                if param.grad is not None:
+                    param.grad.zero_()
+        
+        # 重置位图
+        self.unused_parameter_bitmap.zero_()
+    
+    def forward(self, *inputs, **kwargs):
+        """前向传递，同步参数并调用底层模块的forward"""
+        if self.require_forward_param_sync:
+            self._sync_parameters()
+            
+        return self.module(*inputs, **kwargs)
+    
+    def _sync_parameters(self):
+        """在前向传递之前同步模型参数"""
+        with torch.no_grad():
+            for param in self.module.parameters():
+                if param.requires_grad:
+                    dist.broadcast(param.data, 0)
+    
+    def no_sync(self):
+        """上下文管理器，用于暂时禁用梯度同步（实现梯度累积）"""
+        class _ContextManager:
+            def __init__(self, ddp):
+                self.ddp = ddp
+                self.old_value = ddp.require_backward_grad_sync
+            
+            def __enter__(self):
+                self.ddp.require_backward_grad_sync = False
+                
+            def __exit__(self, *args):
+                self.ddp.require_backward_grad_sync = self.old_value
+        
+        return _ContextManager(self)
+    
+    def synchronize(self):
+        """确保所有bucket的AllReduce操作已完成"""
+        for event in self.bucket_events.values():
+            event.synchronize()
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -269,19 +320,25 @@ def train_worker(gpu, world_size, args):
     model = model.cuda(rank)
     
     # 将模型包装到自定义DDP中
+    # 使用优化技术：
+    # 1. bucket_cap_mb - 梯度桶大小设置
+    # 2. num_process_groups - Round-Robin Process Groups
+    # 3. find_unused_parameters - 处理未使用参数
+    # 4. gradient_as_bucket_view - 优化内存使用
     model = CustomDistributedDataParallel(
         model, 
-        device_ids=[rank],
+        device_ids=[rank], 
         output_device=rank,
-        bucket_cap_mb=25,
+        bucket_cap_mb=25,  # 调整bucket大小以优化通信
         find_unused_parameters=False,
-        num_process_groups=3  # 使用3个进程组进行轮询
+        gradient_as_bucket_view=True,
+        num_process_groups=2  # 使用多个进程组进行Round-Robin调度
     )
     
     # 定义损失函数和优化器
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr,
-                         momentum=args.momentum, weight_decay=args.weight_decay)
+                          momentum=args.momentum, weight_decay=args.weight_decay)
 
     # 学习率调度器
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 80], gamma=0.1)
@@ -289,7 +346,7 @@ def train_worker(gpu, world_size, args):
     # TensorBoard日志(仅在主进程中)
     writer = None
     if rank == 0:
-        writer = SummaryWriter(log_dir='./logs/ddp')
+        writer = SummaryWriter(log_dir='./logs/custom_ddp')
 
     def train(epoch):
         model.train()
@@ -299,39 +356,55 @@ def train_worker(gpu, world_size, args):
         total_samples = 0
         start_time = time.time()
         
+        # 修复：增加梯度累积步数，从2改为4
+        accumulation_steps = 4
+        
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.cuda(rank), target.cuda(rank)
             
-            # 对于累积梯度，我们可以使用no_sync()跳过梯度同步
-            # 除最后一次外的梯度累积不需要同步，这里以4次累积为例
-            grad_acc_steps = 4
-            if (batch_idx % grad_acc_steps) != grad_acc_steps - 1:
+            # 计算当前在累积周期中的位置
+            current_step = batch_idx % accumulation_steps
+            
+            # 修复：正确的梯度累积逻辑
+            if current_step == 0:
+                optimizer.zero_grad()
+            
+            # 前向传播
+            if current_step < accumulation_steps - 1:
+                # 非最后一步：使用no_sync跳过梯度同步
                 with model.no_sync():
                     output = model(data)
-                    loss = criterion(output, target) / grad_acc_steps
+                    loss = criterion(output, target)
+                    # 修复：损失要除以累积步数，保持梯度尺度一致
+                    loss = loss / accumulation_steps
                     loss.backward()
             else:
+                # 最后一步：正常同步梯度
                 output = model(data)
-                loss = criterion(output, target) / grad_acc_steps
+                loss = criterion(output, target)
+                # 修复：损失要除以累积步数
+                loss = loss / accumulation_steps
                 loss.backward()
+                # 修复：在累积结束时才更新参数
                 optimizer.step()
-                optimizer.zero_grad()
             
             _, predicted = output.max(1)
             total_samples += target.size(0)
             running_correct += predicted.eq(target).sum().item()
-            running_loss += loss.detach().item() * target.size(0) * grad_acc_steps
+            # 修复：使用缩放后的损失进行统计
+            running_loss += loss.detach().item() * target.size(0) * accumulation_steps
             
             if rank == 0 and batch_idx % args.log_interval == 0:
                 print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                      f'({100. * batch_idx / len(train_loader):.0f}%)]\t'
-                      f'Loss: {running_loss/total_samples:.4f}\t'
-                      f'Acc: {100. * running_correct / total_samples:.2f}%')
+                    f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.detach().item() * accumulation_steps:.6f}')
+                
+                # 写入TensorBoard
+                step = epoch * len(train_loader) + batch_idx
+                writer.add_scalar('Loss/train_step', loss.detach().item() * accumulation_steps, step)
         
-        # 计算最终的训练时间、损失和准确率
         train_time = time.time() - start_time
         train_loss = running_loss / total_samples
-        train_acc = 100. * running_correct / total_samples
+        train_acc = 100.0 * running_correct / total_samples
         
         if rank == 0:
             print(f'Train Epoch: {epoch}\tLoss: {train_loss:.4f}\tAcc: {train_acc:.2f}%\tTime: {train_time:.2f}s')
@@ -339,13 +412,15 @@ def train_worker(gpu, world_size, args):
             if writer:
                 writer.add_scalar('Loss/train', train_loss, epoch)
                 writer.add_scalar('Accuracy/train', train_acc, epoch)
+                writer.add_scalar('Time/train', train_time, epoch)
         
         return train_time, train_loss, train_acc
-
+    
     def validate(epoch):
         model.eval()
         val_loss = 0
         correct = 0
+        total_samples = 0
         start_time = time.time()
         
         with torch.no_grad():
@@ -353,20 +428,34 @@ def train_worker(gpu, world_size, args):
                 data, target = data.cuda(rank), target.cuda(rank)
                 output = model(data)
                 val_loss += criterion(output, target).item() * target.size(0)
-                pred = output.argmax(dim=1)
-                correct += pred.eq(target).sum().item()
+                
+                _, predicted = output.max(1)
+                total_samples += target.size(0)
+                correct += predicted.eq(target).sum().item()
+        
+        # 收集所有进程的结果
+        val_loss_tensor = torch.tensor([val_loss], device=f'cuda:{rank}')
+        correct_tensor = torch.tensor([correct], device=f'cuda:{rank}')
+        total_tensor = torch.tensor([total_samples], device=f'cuda:{rank}')
+        
+        dist.reduce(val_loss_tensor, 0, op=dist.ReduceOp.SUM)
+        dist.reduce(correct_tensor, 0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_tensor, 0, op=dist.ReduceOp.SUM)
         
         val_time = time.time() - start_time
-        val_loss /= len(val_loader.dataset)
-        val_acc = 100. * correct / len(val_loader.dataset)
         
         if rank == 0:
+            val_loss = val_loss_tensor.item() / total_tensor.item()
+            val_acc = 100.0 * correct_tensor.item() / total_tensor.item()
+            
             print(f'Validation Epoch: {epoch}\tLoss: {val_loss:.4f}\tAcc: {val_acc:.2f}%\tTime: {val_time:.2f}s')
             
             if writer:
                 writer.add_scalar('Loss/val', val_loss, epoch)
                 writer.add_scalar('Accuracy/val', val_acc, epoch)
-        
+        else:
+            val_loss, val_acc = 0, 0
+            
         return val_time, val_loss, val_acc
 
     if rank == 0:
@@ -413,7 +502,7 @@ def train_worker(gpu, world_size, args):
         if rank == 0:
             if val_acc > best_acc:
                 best_acc = val_acc
-                torch.save(model.module.state_dict(), f"{args.save_path}/resnet50_ddp_best.pth")
+                torch.save(model.module.state_dict(), f"{args.save_path}/resnet50_custom_ddp_best.pth")
                 print(f"保存最佳模型, 精度: {best_acc:.2f}%")
             
             # 每个epoch保存一次
@@ -423,11 +512,11 @@ def train_worker(gpu, world_size, args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': lr_scheduler.state_dict(),
                 'best_acc': best_acc,
-            }, f"{args.save_path}/resnet50_ddp_epoch{epoch}.pth")
+            }, f"{args.save_path}/resnet50_custom_ddp_epoch{epoch}.pth")
     
     if rank == 0:
         # 保存最终模型
-        torch.save(model.module.state_dict(), f"{args.save_path}/resnet50_ddp_final.pth")
+        torch.save(model.module.state_dict(), f"{args.save_path}/resnet50_custom_ddp_final.pth")
         
         # 打印最终结果
         print(f"\n训练完成!")
@@ -439,7 +528,7 @@ def train_worker(gpu, world_size, args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data-path', required=True, help='ImageNet数据集路径')
+    parser.add_argument('--data-path', default='/path/to/imagenet', help='ImageNet数据集路径')
     parser.add_argument('--batch-size', type=int, default=128, help='每个GPU的批次大小')
     parser.add_argument('--epochs', type=int, default=90, help='训练轮数')
     parser.add_argument('--lr', type=float, default=0.1, help='初始学习率')
